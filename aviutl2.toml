@@ -1,0 +1,50 @@
+#:schema ./.aviutl2-cli/aviutl2.schema.json
+#
+# ビルドと配布の設定（aviutl2-cli: https://github.com/sevenc-nanashi/aviutl2-cli）。
+#   au2 release   ビルドして release/ に au2pkg を作る
+# project.version は Cargo.toml の version と揃える。
+# 公開先は HexBrowns/EditScript_H（2026-10-08）。カタログ用の JSON は make_plugin_catalog.py が release/catalog.json から作る。
+
+[project]
+id = "HexBrowns.EditScript_H"
+name = "EditScript_H"
+version = "0.2.0"
+
+# LuaJIT のビルド（msvcbuild.bat）は今いるフォルダの minilua を呼ぶ。
+# 環境変数 NoDefaultCurrentDirectoryInExePath が立っていると見つからずに落ちるので、消してから走らせる
+[artifacts."EditScript_H.aux2"]
+build = "set NoDefaultCurrentDirectoryInExePath=&& cargo build --release"
+source = "target/release/edit_script_h.dll"
+destination = "Plugin/EditScript_H/EditScript_H.aux2"
+
+# AI に渡す説明書（パネルの「AI 向けの説明をコピー」と同じもの）
+[artifacts."API.md"]
+source = "assets/API.md"
+destination = "Plugin/EditScript_H/API.md"
+
+# 同梱の例。「例_」で始まるものは版上げで上書きされる（README と API.md に書いてある）
+[artifacts."例_選択を等間隔にずらす.lua"]
+source = "assets/scripts/例_選択を等間隔にずらす.lua"
+destination = "Plugin/EditScript_H/scripts/例_選択を等間隔にずらす.lua"
+
+[artifacts."例_選択に単色化を足す.lua"]
+source = "assets/scripts/例_選択に単色化を足す.lua"
+destination = "Plugin/EditScript_H/scripts/例_選択に単色化を足す.lua"
+
+[artifacts."例_選択の一覧.lua"]
+source = "assets/scripts/例_選択の一覧.lua"
+destination = "Plugin/EditScript_H/scripts/例_選択の一覧.lua"
+
+[release]
+# テストの後、インストール時のダイアログに本体と依存クレートのライセンスを出す
+prebuild = [
+    "set NoDefaultCurrentDirectoryInExePath=&& cargo test",
+    'copy /b /y LICENSE + THIRD_PARTY_NOTICES.md + THIRD_PARTY_CRATES.md release\package.txt >nul',
+]
+package_template = "release/package.txt"
+package_information = "{name} v{version} by HexBrowns"
+
+[catalog]
+id = "HexBrowns.EditScript_H"
+license_path = { type = "MIT", path = "./LICENSE" }
+download_repo = { owner = "HexBrowns", repo = "EditScript_H" }

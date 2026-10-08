@@ -1,0 +1,21 @@
+[package]
+name = "edit-script-h"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "EditScript_H - run Lua scripts that edit the AviUtl2 timeline"
+publish = false
+
+[lib]
+name = "edit_script_h"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+aviutl2 = { version = "0.48", features = ["generic"] }
+aviutl2-eframe = "0.48"
+# LuaJIT を静的リンクする。ビルドの注意は aviutl2.toml の build のコメント
+mlua = { version = "0.11", features = ["luajit", "vendored"] }
+parking_lot = "0.12"
+tracing = "0.1"
