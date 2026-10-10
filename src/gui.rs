@@ -215,7 +215,9 @@ impl EditScriptApp {
         }
         let Some(path) = self.selected.clone() else { return };
         let mut s = self.shared.write();
-        let values: &mut HashMap<String, ParamValue> = s.param_values.entry(path).or_default();
+        let values: &mut HashMap<String, ParamValue> = s.param_values.entry(path.clone()).or_default();
+        // 値は打ち込みの途中では変えず、Enter かほかをクリックしたときに確定する。入力中の Esc は取り消し
+        // （ルール au2-rs-plugin「入力の確定と取り消し」）
         egui::Grid::new("params").num_columns(2).show(ui, |ui| {
             for def in &header.params {
                 ui.label(&def.name);
@@ -225,21 +227,19 @@ impl EditScriptApp {
                 }
                 match (def.kind, v) {
                     (ParamKind::Int, ParamValue::Int(i)) => {
-                        let mut d = egui::DragValue::new(i).speed(0.2);
-                        if let (Some(lo), Some(hi)) = (def.min, def.max) {
-                            d = d.range(lo as i64..=hi as i64);
-                        }
-                        ui.add(d);
+                        drag_value(ui, i, |d| match (def.min, def.max) {
+                            (Some(lo), Some(hi)) => d.speed(0.2).range(lo as i64..=hi as i64),
+                            _ => d.speed(0.2),
+                        });
                     }
                     (ParamKind::Float, ParamValue::Float(f)) => {
-                        let mut d = egui::DragValue::new(f).speed(0.01);
-                        if let (Some(lo), Some(hi)) = (def.min, def.max) {
-                            d = d.range(lo..=hi);
-                        }
-                        ui.add(d);
+                        drag_value(ui, f, |d| match (def.min, def.max) {
+                            (Some(lo), Some(hi)) => d.speed(0.01).range(lo..=hi),
+                            _ => d.speed(0.01),
+                        });
                     }
                     (ParamKind::Str, ParamValue::Str(t)) => {
-                        ui.text_edit_singleline(t);
+                        committed_text(ui, ("param", &path, &def.name), t);
                     }
                     (ParamKind::Bool, ParamValue::Bool(b)) => {
                         ui.checkbox(b, "");
@@ -291,6 +291,7 @@ impl EditScriptApp {
             }
         });
 
+        // 本文の欄は Esc で戻さない（書いた内容が消える）。Esc はフォーカスを外すだけ（egui の既定。`lock_focus` は Tab だけを取る）
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.text)
@@ -344,6 +345,62 @@ impl EditScriptApp {
             }
         });
     }
+}
+
+/// 確定してから使う 1 行の文字（ルール au2-rs-plugin「入力の確定と取り消し」）。
+/// 打っている間は下書き（egui の一時領域）だけを書き換え、Enter かほかをクリックしてフォーカスが外れたときに `value` へ写す。
+/// 入力中の Esc は下書きを捨てる（`value` は入力前のまま）。`DragValue::update_while_editing(false)` と同じ振る舞い
+fn committed_text(ui: &mut egui::Ui, id_salt: impl std::hash::Hash + std::fmt::Debug, value: &mut String) -> egui::Response {
+    let id = ui.make_persistent_id(id_salt);
+    let key = id.with("draft");
+    // 下書きは編集中だけ一時領域にある（フォーカスが外れたフレームで消す）。ほかをクリックしたときは、
+    // egui がこの欄を描いた後でフォーカスを移すことがあるので、フォーカスの有無ではなく下書きの有無で見る
+    let mut draft = ui.data_mut(|d| d.get_temp::<String>(key)).unwrap_or_else(|| value.clone());
+    let resp = ui.add(egui::TextEdit::singleline(&mut draft).id(id));
+    if resp.lost_focus() {
+        ui.data_mut(|d| d.remove_temp::<String>(key));
+        if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            *value = draft;
+        }
+    } else if resp.has_focus() {
+        ui.data_mut(|d| d.insert_temp(key, draft));
+    } else {
+        ui.data_mut(|d| d.remove_temp::<String>(key));
+    }
+    resp
+}
+
+/// 数値欄（ルール au2-rs-plugin「入力の確定と取り消し」）。`configure` で範囲・速さを付けた `DragValue` に
+/// `update_while_editing(false)` を足して置く。打っている途中の値は使わず、Enter かほかをクリックで確定する。
+///
+/// egui 0.36.2 の `DragValue` は `update_while_editing(false)` でも、Esc の次のフレームで打った文字を値にしてしまう
+/// （フォーカスを失ったとみなす期間が 2 フレームあり、2 フレーム目には Esc が押されていないため）。
+/// Esc のフレームの値を覚えておき、次のフレームで戻す（参照実装 LayerSilenceCut_H の `setting_value`）。
+/// 戻したフレームは、欄を描く前と値が同じなら `changed()` を偽にする
+fn drag_value<T>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    configure: impl for<'v> FnOnce(egui::DragValue<'v>) -> egui::DragValue<'v>,
+) -> egui::Response
+where
+    T: egui::emath::Numeric + Default + Send + Sync,
+{
+    let before = *value;
+    let mut resp = ui.add(configure(egui::DragValue::new(&mut *value)).update_while_editing(false));
+    let key = resp.id.with("escaped");
+    let pass = ui.ctx().cumulative_pass_nr();
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(key, (pass, *value)));
+    } else if let Some((at, kept)) = ui.data_mut(|d| d.remove_temp::<(u64, T)>(key)) {
+        if pass == at + 1 {
+            *value = kept;
+            if *value == before {
+                // `flags` は egui の doc(hidden) の公開フィールド。`changed()` を外す手段がこれしかない（0.36.2）
+                resp.flags.remove(egui::response::Flags::CHANGED);
+            }
+        }
+    }
+    resp
 }
 
 /// 予行の結果: 書き換えの予定を番号付きで並べる
@@ -425,5 +482,181 @@ impl eframe::App for EditScriptApp {
         egui::Panel::left("list").resizable(true).default_size(200.0).show(ui, |ui| self.render_list(ui));
         // 中央パネルは最後に追加する
         egui::CentralPanel::default().show(ui, |ui| self.render_editor(ui));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 画面なしで 1 フレーム回す。出力の textures_delta を空にしてから捨てる
+    /// （そのまま捨てると、デバッグビルドで epaint の debug_assert「Dropped TexturesDelta with N unapplied deltas」に落ちる）
+    fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
+        let mut out = ctx.run_ui(input, f);
+        out.textures_delta.clear();
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    enum Focus {
+        Keep,
+        Give,
+        /// ほかをクリックしたときの代わり
+        Take,
+        /// この欄を描いた後で、ほかの欄がフォーカスを取る
+        TakeAfter,
+    }
+
+    /// 画面なしで 1 フレーム描き、欄の ID を返す
+    fn frame(ctx: &egui::Context, value: &mut String, events: Vec<egui::Event>, focus: Focus) -> egui::Id {
+        let mut id = egui::Id::NULL;
+        let input = egui::RawInput { events, ..Default::default() };
+        run_frame(ctx, input, |ui| {
+            let target = ui.make_persistent_id("p");
+            match focus {
+                Focus::Keep | Focus::TakeAfter => {}
+                Focus::Give => ui.memory_mut(|m| m.request_focus(target)),
+                Focus::Take => ui.memory_mut(|m| m.surrender_focus(target)),
+            }
+            id = committed_text(ui, "p", value).id;
+            let other = ui.add(egui::TextEdit::singleline(&mut String::new()).id_salt("other"));
+            if matches!(focus, Focus::TakeAfter) {
+                other.request_focus();
+            }
+        });
+        id
+    }
+
+    fn start_typing(ctx: &egui::Context, value: &mut String, typed: &str) -> egui::Id {
+        frame(ctx, value, vec![], Focus::Keep);
+        let id = frame(ctx, value, vec![], Focus::Give);
+        assert!(ctx.memory(|m| m.has_focus(id)));
+        frame(ctx, value, vec![egui::Event::Text(typed.into())], Focus::Keep);
+        id
+    }
+
+    /// 打っている間は値を変えない。Enter で確定する
+    #[test]
+    fn committed_text_commits_on_enter() {
+        let ctx = egui::Context::default();
+        let mut value = String::from("abc");
+        start_typing(&ctx, &mut value, "xy");
+        assert_eq!(value, "abc");
+        frame(&ctx, &mut value, vec![key(egui::Key::Enter)], Focus::Keep);
+        assert_eq!(value, "abcxy");
+    }
+
+    /// ほかをクリックしてフォーカスが外れたときも確定する
+    #[test]
+    fn committed_text_commits_on_blur() {
+        let ctx = egui::Context::default();
+        let mut value = String::from("abc");
+        start_typing(&ctx, &mut value, "xy");
+        frame(&ctx, &mut value, vec![], Focus::Take);
+        assert_eq!(value, "abcxy");
+
+        // フォーカスがフレームの途中で移った（この欄はまだフォーカスを持って描かれた）ときは、次のフレームで確定する
+        let mut value = String::from("abc");
+        let ctx = egui::Context::default();
+        start_typing(&ctx, &mut value, "z");
+        frame(&ctx, &mut value, vec![], Focus::TakeAfter);
+        assert_eq!(value, "abc");
+        frame(&ctx, &mut value, vec![], Focus::Keep);
+        assert_eq!(value, "abcz");
+    }
+
+    /// 入力中の Esc は取り消し。値は入力前のまま、次に入るときも元の値から始まる
+    #[test]
+    fn committed_text_discards_on_escape() {
+        let ctx = egui::Context::default();
+        let mut value = String::from("abc");
+        let id = start_typing(&ctx, &mut value, "xy");
+        frame(&ctx, &mut value, vec![key(egui::Key::Escape)], Focus::Keep);
+        assert_eq!(value, "abc");
+        assert!(!ctx.memory(|m| m.has_focus(id)));
+        start_typing(&ctx, &mut value, "z");
+        frame(&ctx, &mut value, vec![key(egui::Key::Enter)], Focus::Keep);
+        assert_eq!(value, "abcz");
+    }
+
+    /// 欄の外で値が変わったら（スクリプトを選び直した等）、編集していない欄はその値を出す
+    #[test]
+    fn committed_text_follows_value_when_idle() {
+        let ctx = egui::Context::default();
+        let mut value = String::from("abc");
+        frame(&ctx, &mut value, vec![], Focus::Keep);
+        value = "def".into();
+        start_typing(&ctx, &mut value, "!");
+        frame(&ctx, &mut value, vec![key(egui::Key::Enter)], Focus::Keep);
+        assert_eq!(value, "def!");
+    }
+
+    // ---- 数値欄（param の整数・小数） ----
+
+    /// 画面なしで数値欄を 1 フレーム描き、`changed()` を返す。`focus` なら描く前にフォーカスを移す（クリックと同じく全選択で編集に入る）
+    fn frame_num<T>(ctx: &egui::Context, value: &mut T, events: Vec<egui::Event>, focus: bool) -> bool
+    where
+        T: egui::emath::Numeric + Default + Send + Sync,
+    {
+        let mut changed = false;
+        let input = egui::RawInput { events, ..Default::default() };
+        run_frame(ctx, input, |ui| {
+            if focus {
+                let id = ui.data(|d| d.get_temp::<egui::Id>(egui::Id::new("num_id")));
+                if let Some(id) = id {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+            }
+            let resp = drag_value(ui, value, |d| d.speed(0.2).range(T::from_f64(-1000.0)..=T::from_f64(1000.0)));
+            ui.data_mut(|d| d.insert_temp(egui::Id::new("num_id"), resp.id));
+            changed = resp.changed();
+        });
+        changed
+    }
+
+    /// 打つ（まだ確定しない）
+    fn type_num<T>(ctx: &egui::Context, value: &mut T, typed: &str)
+    where
+        T: egui::emath::Numeric + Default + Send + Sync,
+    {
+        frame_num(ctx, value, vec![], false);
+        frame_num(ctx, value, vec![], true);
+        frame_num(ctx, value, vec![egui::Event::Text(typed.into())], false);
+    }
+
+    /// 打つ → Esc → その後 3 フレーム、値は入力前のまま。Enter で確定した値は残る
+    fn check_escape_and_enter<T>(start: T, typed: &str, expected: T)
+    where
+        T: egui::emath::Numeric + Default + Send + Sync + std::fmt::Debug,
+    {
+        let ctx = egui::Context::default();
+        let mut v = start;
+        type_num(&ctx, &mut v, typed);
+        assert_eq!(v, start, "打っている途中の値を使っている");
+        assert!(!frame_num(&ctx, &mut v, vec![key(egui::Key::Escape)], false));
+        for _ in 0..3 {
+            let changed = frame_num(&ctx, &mut v, vec![], false);
+            assert_eq!(v, start, "Esc の後のフレームでも入力前の値のまま");
+            assert!(!changed);
+        }
+
+        type_num(&ctx, &mut v, typed);
+        assert!(frame_num(&ctx, &mut v, vec![key(egui::Key::Enter)], false));
+        for _ in 0..3 {
+            frame_num(&ctx, &mut v, vec![], false);
+        }
+        assert_eq!(v, expected, "Enter で確定した値は残る");
+    }
+
+    #[test]
+    fn int_param_escape_discards_and_enter_commits() {
+        check_escape_and_enter::<i64>(3, "42", 42);
+    }
+
+    #[test]
+    fn float_param_escape_discards_and_enter_commits() {
+        check_escape_and_enter::<f64>(0.5, "2.25", 2.25);
     }
 }
