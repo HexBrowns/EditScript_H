@@ -88,8 +88,6 @@ struct Prepared {
     allow_scene: bool,
     params: Vec<(String, ParamValue)>,
     timeout: Duration,
-    /// `aviutl2.ini` に登録済みの移動方法。読めなかったら None（検査しない）
-    movements: Option<HashSet<String>>,
     effect_names: Vec<String>,
     dry: bool,
 }
@@ -123,7 +121,6 @@ pub fn run(req: RunRequest) -> RunReport {
         allow_scene: req.header.scene,
         params: req.params,
         timeout: req.timeout,
-        movements: load_movements(),
         effect_names,
         dry,
     };
@@ -167,19 +164,11 @@ fn guarded(f: impl FnOnce() -> Outcome) -> Outcome {
     }
 }
 
-/// `aviutl2.ini` の `[Movement.名前]` を集める
-fn load_movements() -> Option<HashSet<String>> {
-    let path = aviutl2::config::app_data_path().join("aviutl2.ini");
-    let bytes = std::fs::read(&path).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    Some(parse_movements(&text))
-}
+/// 本体に登録されている移動方法（`movement.rs`）。起動時の `register` で 1 回だけ作る。無ければ検査しない
+static MOVEMENTS: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
 
-pub fn parse_movements(ini: &str) -> HashSet<String> {
-    ini.lines()
-        .filter_map(|l| l.trim().strip_prefix("[Movement.").and_then(|s| s.strip_suffix(']')))
-        .map(str::to_string)
-        .collect()
+pub fn init_movements(set: HashSet<String>) {
+    let _ = MOVEMENTS.set(set);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,43 +322,63 @@ pub fn short_value(s: &str) -> String {
     }
 }
 
-/// トラックの値として渡す文字列を確かめる。
-/// ClaudeBridge の記録（2026-07）では、4 項目（開始値, 終了値, 移動方法, 設定）に満たない値と、`aviutl2.ini` に
-/// 登録されていない移動方法で本体が落ちた。現行の本体で同じかは未確認なので、確かめるまでは手前で止める
-pub fn check_track_value(value: &str, movements: Option<&HashSet<String>>) -> Result<(), String> {
+/// トラックの値として渡す文字列を確かめる。形は `値1,…,値N,移動方法,設定`（ルール `au2-rs-plugin`「設定項目の値の形式」）。
+/// - 数値として読める並びの後の、最初の数値でない要素が移動方法。**残り全部が設定**（設定の中にカンマが入る。`0|9,0,1`）
+/// - 設定は省略できない（無いと数値が移動方法の名前とみなされ、本体が例外 `not found movement` で編集を打ち切る）
+/// - 移動方法は本体に登録されている名前だけ（`movements`。None なら検査しない）
+/// - `points`（開始・中間点・終了の数）が分かれば、値の数と合うかも見る。中間点無視（設定のビット 4）と再生範囲は値 2 つでよい
+pub fn check_track_value(value: &str, movements: Option<&HashSet<String>>, points: Option<usize>) -> Result<(), String> {
     let fields: Vec<&str> = value.split(',').map(str::trim).collect();
-    if fields.len() == 1 {
-        return fields[0]
-            .parse::<f64>()
-            .map(|_| ())
-            .map_err(|_| format!("トラックの値「{value}」が数値ではありません"));
+    let n_values = fields.iter().take_while(|f| f.parse::<f64>().is_ok()).count();
+    if n_values == fields.len() {
+        return match n_values {
+            1 => Ok(()),
+            _ => Err(format!(
+                "トラックの値「{value}」に移動方法がありません。動かさないなら数値 1 つ、動かすなら「開始値,終了値,移動方法,設定」の形にしてください"
+            )),
+        };
     }
-    if fields.len() < 4 {
+    if n_values == 0 {
+        return Err(format!("トラックの値「{value}」の「{}」が数値ではありません", fields[0]));
+    }
+    let mode = fields[n_values];
+    let setting = &fields[n_values + 1..];
+    if setting.is_empty() || setting[0].is_empty() {
         return Err(format!(
-            "トラックの値「{value}」は「開始値,終了値,移動方法,設定」の形にしてください（項目が足りないと本体が落ちることがあります）"
+            "トラックの値「{value}」に設定がありません。移動方法の後ろに設定（無ければ 0）を付けてください（無いと本体が編集を打ち切ります）"
         ));
     }
-    let n = fields.len();
-    if let Some(bad) = fields[..n - 2].iter().find(|f| f.parse::<f64>().is_err()) {
-        return Err(format!("トラックの値「{value}」の「{bad}」が数値ではありません"));
-    }
-    let mode = fields[n - 2];
     if let Some(set) = movements {
         if !set.contains(mode) {
             return Err(format!(
-                "移動方法「{mode}」は aviutl2.ini に登録されていません。画面で一度その移動方法を選んでから、AviUtl2 を再起動してください（登録されていない移動方法を渡すと本体が落ちることがあります）"
+                "移動方法「{mode}」は本体に登録されていません（Script フォルダの .tra2 と組み込みの名前に無い。起動後に置いた .tra2 は再起動まで使えません）"
+            ));
+        }
+    }
+    if n_values < 2 && mode != "移動無し" {
+        return Err(format!("トラックの値「{value}」は、移動方法の前に開始値と終了値の 2 つ以上が要ります"));
+    }
+    if let Some(points) = points.filter(|_| mode != "移動無し") {
+        let bits = setting[0].split('|').next().unwrap_or("").parse::<u32>().unwrap_or(0);
+        let two_ok = bits & 4 != 0 || crate::movement::TWO_VALUE.contains(&mode);
+        if n_values != points && !(two_ok && n_values == 2) {
+            return Err(format!(
+                "トラックの値「{value}」の数値は {n_values} 個ですが、このオブジェクトの点（開始・中間点・終了）は {points} 個です。数を合わせてください（合わないと本体はそのまま保存し、動きが変わります）"
             ));
         }
     }
     Ok(())
 }
 
-fn guard_track(lua: &Lua, track: EditSectionResult<TrackInfo>, value: &str) -> mlua::Result<()> {
-    // トラックでない項目（テキストなど）は情報が取れない。そのときは検査しない
+fn guard_track(lua: &Lua, track: EditSectionResult<TrackInfo>, object: Option<ObjectHandle>, value: &str) -> mlua::Result<()> {
+    // トラックでない項目（テキストなど）は情報が取れない。そのときは検査しない。
+    // 数値 1 つは移動なしにする書き方なので通す（動いているトラックでは移動と中間点の値が消える。API.md に書いた）
     if track.is_err() || !value.contains(',') && value.trim().parse::<f64>().is_ok() {
         return Ok(());
     }
-    check_track_value(value, ctx(lua)?.movements).map_err(mlua::Error::runtime)
+    let c = ctx(lua)?;
+    let points = object.and_then(|o| c.read.get_object_section_num(o).ok()).map(|n| n + 1);
+    check_track_value(value, c.movements, points).map_err(mlua::Error::runtime)
 }
 
 fn track_info_table(lua: &Lua, t: TrackInfo) -> mlua::Result<Table> {
@@ -549,7 +558,7 @@ impl UserData for LObject {
             let idx = index.unwrap_or(0);
             if let Obj::Real(h) = this.0 {
                 let track = ctx(lua)?.read.get_object_track_info(h, &effect, idx, &item);
-                guard_track(lua, track, &value)?;
+                guard_track(lua, track, Some(h), &value)?;
             }
             let t = writer(lua)?;
             write(
@@ -723,7 +732,11 @@ impl UserData for LEffect {
             let value = value_to_item_string(&value)?;
             if let Eff::Real(h) = this.effect {
                 let track = ctx(lua)?.read.get_effect_track_info(h, &item);
-                guard_track(lua, track, &value)?;
+                let object = match this.object {
+                    Obj::Real(o) => Some(o),
+                    Obj::Virtual(_) => None,
+                };
+                guard_track(lua, track, object, &value)?;
             }
             let t = writer(lua)?;
             write(
@@ -1088,7 +1101,7 @@ fn execute(read: &ReadSection, edit: Option<&EditSection>, info: EditInfo, p: &P
         info,
         writes: Cell::new(0),
         allow_scene: p.allow_scene,
-        movements: p.movements.as_ref(),
+        movements: MOVEMENTS.get(),
         effect_names: &p.effect_names,
         plan: p.dry.then(|| RefCell::new(Vec::new())),
         next_virtual: Cell::new(0),
@@ -1212,15 +1225,27 @@ mod tests {
 
     #[test]
     fn track_values() {
-        let reg: HashSet<String> = ["直線移動".to_string()].into_iter().collect();
-        assert!(check_track_value("100", Some(&reg)).is_ok());
-        assert!(check_track_value("-960.00,960.00,直線移動,4", Some(&reg)).is_ok());
-        assert!(check_track_value("0,50,100,直線移動,0", Some(&reg)).is_ok());
-        assert!(check_track_value("0,100", Some(&reg)).is_err());
-        assert!(check_track_value("0,100,直線移動", Some(&reg)).is_err());
-        assert!(check_track_value("0,100,未登録の移動,0", Some(&reg)).is_err());
-        assert!(check_track_value("0,100,未登録の移動,0", None).is_ok());
-        assert!(check_track_value("abc", None).is_err());
+        let reg: HashSet<String> =
+            ["直線移動", "プローブ移動_H", "再生範囲"].into_iter().map(str::to_string).collect();
+        let ok = |v: &str, p: Option<usize>| check_track_value(v, Some(&reg), p).is_ok();
+        assert!(ok("100", None));
+        assert!(ok("-960.00,960.00,直線移動,4", None));
+        assert!(ok("0,50,100,直線移動,0", None));
+        assert!(!ok("0,100", None));
+        assert!(!ok("0,100,直線移動", None));
+        assert!(!ok("0,100,未登録の移動,0", None));
+        assert!(check_track_value("0,100,未登録の移動,0", None, None).is_ok());
+        assert!(check_track_value("abc", None, None).is_err());
+        // 設定の中のカンマ（後ろから数えると移動方法を取り違える）
+        assert!(ok("0,100,プローブ移動_H,0|9,0,1", Some(2)));
+        // 点の数と値の数
+        assert!(ok("0,50,100,直線移動,0", Some(3)));
+        assert!(!ok("0,100,直線移動,0", Some(3)));
+        assert!(!ok("0,50,100,直線移動,0", Some(2)));
+        // 中間点無視（ビット 4）と再生範囲は値 2 つでよい
+        assert!(ok("0,100,直線移動,4", Some(4)));
+        assert!(ok("0,100,直線移動,5|", Some(4)));
+        assert!(ok("0,100,再生範囲,0", Some(3)));
     }
 
     /// 同梱の例と、API.md のコードブロックが構文として通り、見出しも読める
@@ -1248,11 +1273,5 @@ mod tests {
             blocks += 1;
         }
         assert!(blocks >= 3, "API.md のコードブロックが {blocks} 個しか無い");
-    }
-
-    #[test]
-    fn movements_from_ini() {
-        let s = parse_movements("[Movement.直線移動]\nx=1\n[Movement.4次式@Basic_S]\n[Other]\n");
-        assert!(s.contains("直線移動") && s.contains("4次式@Basic_S") && s.len() == 2);
     }
 }

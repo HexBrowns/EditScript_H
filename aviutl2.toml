@@ -8,7 +8,7 @@
 [project]
 id = "HexBrowns.EditScript_H"
 name = "EditScript_H"
-version = "0.2.0"
+version = "0.2.1"
 
 # LuaJIT のビルド（msvcbuild.bat）は今いるフォルダの minilua を呼ぶ。
 # 環境変数 NoDefaultCurrentDirectoryInExePath が立っていると見つからずに落ちるので、消してから走らせる

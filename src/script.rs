@@ -47,10 +47,14 @@ pub struct ParamDef {
 }
 
 impl ParamDef {
-    /// 範囲に収めた値
+    /// 範囲に収めた値。範囲が壊れている（最小 > 最大・NaN）ときはそのまま返す
+    /// （`f64::clamp` はそのとき panic する。見出しの読み取りでも弾いている）
     pub fn clamp(&self, v: &ParamValue) -> ParamValue {
         let lo = self.min.unwrap_or(f64::NEG_INFINITY);
         let hi = self.max.unwrap_or(f64::INFINITY);
+        if !(lo <= hi) {
+            return v.clone();
+        }
         match v {
             ParamValue::Int(i) => ParamValue::Int((*i as f64).clamp(lo, hi) as i64),
             ParamValue::Float(f) => ParamValue::Float(f.clamp(lo, hi)),
@@ -127,10 +131,18 @@ fn parse_param(value: &str) -> Result<ParamDef, String> {
         if s.is_empty() {
             return Ok(None);
         }
-        s.parse::<f64>().map(Some).map_err(|_| format!("{what}「{s}」が数値でない"))
+        match s.parse::<f64>() {
+            Ok(v) if !v.is_nan() => Ok(Some(v)),
+            _ => Err(format!("{what}「{s}」が数値でない")),
+        }
     };
     let min = num(fields.get(1).copied().unwrap_or(""), "最小")?;
     let max = num(fields.get(2).copied().unwrap_or(""), "最大")?;
+    if let (Some(lo), Some(hi)) = (min, max) {
+        if lo > hi {
+            return Err(format!("最小（{lo}）が最大（{hi}）より大きい"));
+        }
+    }
     let default = match kind {
         ParamKind::Int => {
             let v = if default_s.is_empty() { 0 } else { default_s.parse::<i64>().map_err(|_| format!("初期値「{default_s}」が整数でない"))? };
@@ -306,6 +318,17 @@ mod tests {
         );
         assert_eq!(h.errors.len(), 8, "{:?}", h.errors);
         assert_eq!(h.params.len(), 1);
+    }
+
+    #[test]
+    fn param_bad_range_is_error_not_panic() {
+        // 最小 > 最大（打っている途中の「0, 5, 1」も含む）と NaN は panic せずにエラーにする
+        let h = parse_header("--@param: n, int, 5, 10, 1\n--@param: m, int, 0, 5, 1\n--@param: f, float, 0.5, nan, 1\n");
+        assert_eq!(h.errors.len(), 3, "{:?}", h.errors);
+        assert!(h.params.is_empty());
+        // 壊れた範囲を直接持つ ParamDef でも clamp は panic しない
+        let def = ParamDef { name: "x".into(), kind: ParamKind::Int, default: ParamValue::Int(3), min: Some(10.0), max: Some(1.0) };
+        assert_eq!(def.clamp(&ParamValue::Int(3)), ParamValue::Int(3));
     }
 
     #[test]

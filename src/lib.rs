@@ -8,6 +8,7 @@
 //! - 自分で起こすスレッドは無い
 
 mod gui;
+mod movement;
 mod runner;
 mod script;
 
@@ -135,6 +136,8 @@ fn init_logging() {
 pub struct EditScriptPlugin {
     window: Mutex<Option<aviutl2_eframe::EframeWindow>>,
     shared: SharedState,
+    /// 読み込まれた時刻。これより新しい .tra2 は本体に登録されていない（`movement.rs`）
+    loaded_at: std::time::SystemTime,
 }
 
 impl aviutl2::generic::GenericPlugin for EditScriptPlugin {
@@ -154,6 +157,7 @@ impl aviutl2::generic::GenericPlugin for EditScriptPlugin {
                 registered_menus: HashMap::new(),
                 egui_ctx: None,
             })),
+            loaded_at: std::time::SystemTime::now(),
         })
     }
 
@@ -166,6 +170,13 @@ impl aviutl2::generic::GenericPlugin for EditScriptPlugin {
 
     fn register(&mut self, registry: &mut aviutl2::generic::HostAppHandle) {
         runner::EDIT_HANDLE.init(registry.create_edit_handle());
+
+        // トラックバーの値の検査に使う移動方法の名前（本体が起動時に読んだ .tra2 から。aviutl2.ini は使わない）
+        let script_dir = aviutl2::config::app_data_path().join("Script");
+        let bundled = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("script.tra2")));
+        let movements = movement::scan(&script_dir, bundled.as_deref(), Some(self.loaded_at));
+        tracing::info!("EditScript_H: 移動方法 {} 件", movements.len());
+        runner::init_movements(movements);
 
         // 右クリックメニュー。登録できるのは起動時だけ
         let dir = self.shared.read().scripts_dir.clone();
